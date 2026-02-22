@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -173,19 +174,64 @@ func parseRepo(input string) (owner, repo string, err error) {
 	return parts[0], parts[1], nil
 }
 
-func Run(ctx context.Context, repoIn, outPath string, workers int) error {
-	repoIn = strings.TrimSpace(repoIn)
-	if repoIn == "" {
-		return fmt.Errorf("repo is required")
+func outputPathForRepo(basePath, owner, repo string) string {
+	basePath = strings.TrimSpace(basePath)
+	if basePath == "" {
+		return ""
 	}
 
-	owner, repo, err := parseRepo(repoIn)
-	if err != nil {
-		return err
+	if info, err := os.Stat(basePath); err == nil && info.IsDir() {
+		return filepath.Join(basePath, fmt.Sprintf("%s-%s.csv", owner, repo))
+	}
+
+	ext := filepath.Ext(basePath)
+	if ext == "" {
+		return fmt.Sprintf("%s-%s-%s.csv", basePath, owner, repo)
+	}
+
+	dir := filepath.Dir(basePath)
+	base := strings.TrimSuffix(filepath.Base(basePath), ext)
+	return filepath.Join(dir, fmt.Sprintf("%s-%s-%s%s", base, owner, repo, ext))
+}
+
+func Run(ctx context.Context, repos []string, outPath string, workers int) error {
+	if len(repos) == 0 {
+		return fmt.Errorf("repo is required")
 	}
 
 	token := strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
 	client := newClient(token)
+	multi := len(repos) > 1
+
+	for _, repoIn := range repos {
+		repoIn = strings.TrimSpace(repoIn)
+		if repoIn == "" {
+			return fmt.Errorf("repo is required")
+		}
+
+		owner, repo, err := parseRepo(repoIn)
+		if err != nil {
+			return err
+		}
+
+		targetOut := outPath
+		if multi {
+			targetOut = outputPathForRepo(outPath, owner, repo)
+		}
+		if targetOut == "" {
+			return fmt.Errorf("out path is required")
+		}
+
+		if err := runRepo(ctx, client, owner, repo, targetOut, workers); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func runRepo(ctx context.Context, client *client, owner, repo, outPath string, workers int) error {
+	repoLabel := fmt.Sprintf("%s/%s", owner, repo)
 
 	users := map[string]*userRow{}
 	addUser := func(login, source string) {
@@ -206,7 +252,7 @@ func Run(ctx context.Context, repoIn, outPath string, workers int) error {
 
 	perPage := 100
 
-	fmt.Fprintln(os.Stderr, "Fetching contributors...")
+	fmt.Fprintf(os.Stderr, "Fetching contributors for %s...\n", repoLabel)
 	if err := client.paginateGET(ctx,
 		fmt.Sprintf("/repos/%s/%s/contributors?per_page=%d&anon=false", owner, repo, perPage),
 		func(raw json.RawMessage) error {
@@ -225,7 +271,7 @@ func Run(ctx context.Context, repoIn, outPath string, workers int) error {
 		fmt.Fprintf(os.Stderr, "Warning: contributors fetch failed: %v\n", err)
 	}
 
-	fmt.Fprintln(os.Stderr, "Fetching issues (authors)...")
+	fmt.Fprintf(os.Stderr, "Fetching issues (authors) for %s...\n", repoLabel)
 	if err := client.paginateGET(ctx,
 		fmt.Sprintf("/repos/%s/%s/issues?state=all&per_page=%d", owner, repo, perPage),
 		func(raw json.RawMessage) error {
@@ -250,7 +296,7 @@ func Run(ctx context.Context, repoIn, outPath string, workers int) error {
 		fmt.Fprintf(os.Stderr, "Warning: issues fetch failed: %v\n", err)
 	}
 
-	fmt.Fprintln(os.Stderr, "Fetching pull requests (authors)...")
+	fmt.Fprintf(os.Stderr, "Fetching pull requests (authors) for %s...\n", repoLabel)
 	if err := client.paginateGET(ctx,
 		fmt.Sprintf("/repos/%s/%s/pulls?state=all&per_page=%d", owner, repo, perPage),
 		func(raw json.RawMessage) error {
@@ -271,7 +317,7 @@ func Run(ctx context.Context, repoIn, outPath string, workers int) error {
 		fmt.Fprintf(os.Stderr, "Warning: pull requests fetch failed: %v\n", err)
 	}
 
-	fmt.Fprintln(os.Stderr, "Fetching stargazers...")
+	fmt.Fprintf(os.Stderr, "Fetching stargazers for %s...\n", repoLabel)
 	if err := client.paginateGET(ctx,
 		fmt.Sprintf("/repos/%s/%s/stargazers?per_page=%d", owner, repo, perPage),
 		func(raw json.RawMessage) error {
@@ -290,7 +336,7 @@ func Run(ctx context.Context, repoIn, outPath string, workers int) error {
 		fmt.Fprintf(os.Stderr, "Warning: stargazers fetch failed: %v\n", err)
 	}
 
-	fmt.Fprintln(os.Stderr, "Fetching forks (owners)...")
+	fmt.Fprintf(os.Stderr, "Fetching forks (owners) for %s...\n", repoLabel)
 	if err := client.paginateGET(ctx,
 		fmt.Sprintf("/repos/%s/%s/forks?per_page=%d", owner, repo, perPage),
 		func(raw json.RawMessage) error {
@@ -315,7 +361,7 @@ func Run(ctx context.Context, repoIn, outPath string, workers int) error {
 		return fmt.Errorf("no users found (repo may be empty, or API calls failed)")
 	}
 
-	fmt.Fprintf(os.Stderr, "Fetching user details for %d users...\n", len(users))
+	fmt.Fprintf(os.Stderr, "Fetching user details for %d users (%s)...\n", len(users), repoLabel)
 
 	type ghUser struct {
 		Login string `json:"login"`

@@ -16,6 +16,23 @@ import (
 	"time"
 )
 
+var redditCSVHeader = []string{
+	"relevance",
+	"created_utc",
+	"date_utc",
+	"subreddit",
+	"title",
+	"author",
+	"score",
+	"num_comments",
+	"providers",
+	"matched_query",
+	"sort",
+	"permalink",
+	"url",
+	"selftext_excerpt",
+}
+
 type listing struct {
 	Data struct {
 		After    string  `json:"after"`
@@ -162,6 +179,24 @@ func buildOptimizedQueries(topic string) []string {
 	return out
 }
 
+func dedupeQueries(queries []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(queries))
+	for _, q := range queries {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		qLower := strings.ToLower(q)
+		if seen[qLower] {
+			continue
+		}
+		seen[qLower] = true
+		out = append(out, q)
+	}
+	return out
+}
+
 var nonWord = regexp.MustCompile(`[^a-z0-9]+`)
 
 func tokens(s string) []string {
@@ -287,34 +322,20 @@ func buildSearchURL(subreddit, query, sort, after string) string {
 	return base + "?" + v.Encode()
 }
 
-func Run(ctx context.Context, topic, subreddit, outPath string, limit, days, sleepMs int) error {
-	topic = strings.TrimSpace(topic)
-	if topic == "" {
-		return fmt.Errorf("topic is required")
-	}
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > 2000 {
-		limit = 2000
-	}
-	if days < 1 {
-		days = 365
-	}
-	if sleepMs < 0 {
-		sleepMs = 0
-	}
-
+func fetchResults(ctx context.Context, topics []string, subreddit string, limit, minutes, sleepMs int) ([]result, int) {
 	client := newClient()
-	queries := buildOptimizedQueries(topic)
+	queries := make([]string, 0, len(topics)*4)
+	for _, topic := range topics {
+		queries = append(queries, buildOptimizedQueries(topic)...)
+	}
+	queries = dedupeQueries(queries)
 	sorts := []string{"relevance", "new"}
 
 	resultsByID := map[string]result{}
-	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	cutoff := time.Now().Add(-time.Duration(minutes) * time.Minute)
 
 	reqCount := 0
 
-	fmt.Fprintf(os.Stderr, "Running %d optimized queries across %d sorts...\n", len(queries), len(sorts))
 	for _, q := range queries {
 		for _, sortMode := range sorts {
 			after := ""
@@ -391,6 +412,10 @@ func Run(ctx context.Context, topic, subreddit, outPath string, limit, days, sle
 		all = all[:limit]
 	}
 
+	return all, reqCount
+}
+
+func writeCSV(outPath string, results []result) error {
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
@@ -400,26 +425,23 @@ func Run(ctx context.Context, topic, subreddit, outPath string, limit, days, sle
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	if err := w.Write([]string{
-		"relevance",
-		"created_utc",
-		"date_utc",
-		"subreddit",
-		"title",
-		"author",
-		"score",
-		"num_comments",
-		"providers",
-		"matched_query",
-		"sort",
-		"permalink",
-		"url",
-		"selftext_excerpt",
-	}); err != nil {
+	if err := w.Write(redditCSVHeader); err != nil {
 		return fmt.Errorf("writing CSV header: %w", err)
 	}
 
-	for _, r := range all {
+	if err := writeRows(w, results); err != nil {
+		return err
+	}
+
+	if err := w.Error(); err != nil {
+		return fmt.Errorf("writing CSV: %w", err)
+	}
+
+	return nil
+}
+
+func writeRows(w *csv.Writer, results []result) error {
+	for _, r := range results {
 		p := r.Post
 		created := time.Unix(int64(p.CreatedUTC), 0).UTC()
 		permalink := "https://www.reddit.com" + p.Permalink
@@ -445,11 +467,122 @@ func Run(ctx context.Context, topic, subreddit, outPath string, limit, days, sle
 		}
 	}
 
-	if err := w.Error(); err != nil {
-		return fmt.Errorf("writing CSV: %w", err)
+	return nil
+}
+
+func openAppendWriter(outPath string) (*os.File, *csv.Writer, error) {
+	var size int64
+	if info, err := os.Stat(outPath); err == nil {
+		size = info.Size()
+	} else if !os.IsNotExist(err) {
+		return nil, nil, fmt.Errorf("stat output file: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Done. Requests: %d | Candidates: %d | Wrote: %d -> %s\n",
-		reqCount, len(resultsByID), len(all), outPath)
-	return nil
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening output file: %w", err)
+	}
+
+	w := csv.NewWriter(f)
+	if size == 0 {
+		if err := w.Write(redditCSVHeader); err != nil {
+			f.Close()
+			return nil, nil, fmt.Errorf("writing CSV header: %w", err)
+		}
+		w.Flush()
+		if err := w.Error(); err != nil {
+			f.Close()
+			return nil, nil, fmt.Errorf("writing CSV header: %w", err)
+		}
+	}
+
+	return f, w, nil
+}
+
+func Run(ctx context.Context, topics []string, subreddit, outPath string, limit, minutes, sleepMs, intervalSeconds int, notify bool) error {
+	cleanTopics := make([]string, 0, len(topics))
+	for _, topic := range topics {
+		topic = strings.TrimSpace(topic)
+		if topic != "" {
+			cleanTopics = append(cleanTopics, topic)
+		}
+	}
+	if len(cleanTopics) == 0 {
+		return fmt.Errorf("topic is required")
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	if minutes < 1 {
+		minutes = 1
+	}
+	if sleepMs < 0 {
+		sleepMs = 0
+	}
+	if intervalSeconds < 1 {
+		intervalSeconds = 30
+	}
+
+	if !notify {
+		results, reqCount := fetchResults(ctx, cleanTopics, subreddit, limit, minutes, sleepMs)
+		if len(results) == 0 {
+			return fmt.Errorf("no results found")
+		}
+		if err := writeCSV(outPath, results); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "Done. Requests: %d | Wrote: %d -> %s\n",
+			reqCount, len(results), outPath)
+		return nil
+	}
+
+	f, w, err := openAppendWriter(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	defer w.Flush()
+
+	seen := map[string]bool{}
+	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		results, _ := fetchResults(ctx, cleanTopics, subreddit, limit, minutes, sleepMs)
+		newOnes := make([]result, 0, len(results))
+		for _, r := range results {
+			if seen[r.Post.ID] {
+				continue
+			}
+			seen[r.Post.ID] = true
+			newOnes = append(newOnes, r)
+		}
+
+		sort.Slice(newOnes, func(i, j int) bool {
+			return newOnes[i].Post.CreatedUTC < newOnes[j].Post.CreatedUTC
+		})
+
+		for _, r := range newOnes {
+			fmt.Fprintf(os.Stderr, "Match: r/%s | %s | %s\n", r.Post.Subreddit, r.Post.Title, "https://www.reddit.com"+r.Post.Permalink)
+		}
+
+		if len(newOnes) > 0 {
+			if err := writeRows(w, newOnes); err != nil {
+				return err
+			}
+			w.Flush()
+			if err := w.Error(); err != nil {
+				return fmt.Errorf("writing CSV: %w", err)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }

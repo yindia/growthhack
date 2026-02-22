@@ -34,7 +34,8 @@ brew install yindia/homebrew-yindia/growthhack
 # Export users from a repo
 GITHUB_TOKEN=your_token \
   go run . github \
-  --repo owner/repo \
+  --topic owner/repo \
+  --topic another/repo \
   --out users.csv \
   --workers 8
 ```
@@ -42,6 +43,7 @@ GITHUB_TOKEN=your_token \
 Notes:
 - `GITHUB_TOKEN` is optional but recommended to avoid rate limits.
 - Only users with a public email are written to the CSV.
+- When multiple repos are provided, the output filename is suffixed with the repo name.
 
 ### Reddit
 
@@ -49,12 +51,19 @@ Notes:
 # Search Reddit and write a CSV of relevant posts
 go run . reddit \
   --topic "github webhook integration" \
+  --topic "gitlab webhook receiver" \
   --subreddit webdev \
   --out reddit_posts.csv \
   --limit 200 \
-  --days 365 \
-  --sleep-ms 850
+  --minutes 1 \
+  --sleep-ms 850 \
+  --notify \
+  --interval 30
 ```
+
+Notes:
+- `--notify` is off by default; pass `--notify` to keep polling and print new matches as they arrive.
+- `--interval` controls the polling frequency (in seconds) for notify mode.
 
 ### Hacker News
 
@@ -62,11 +71,18 @@ go run . reddit \
 # Search Hacker News and write a CSV of relevant stories
 go run . hackernews \
   --topic "webhook integration" \
+  --topic "github app webhook" \
   --out hackernews_posts.csv \
   --limit 200 \
-  --days 365 \
-  --sleep-ms 200
+  --minutes 1 \
+  --sleep-ms 200 \
+  --notify \
+  --interval 30
 ```
+
+Notes:
+- `--notify` is off by default; pass `--notify` to keep polling and print new matches as they arrive.
+- `--interval` controls the polling frequency (in seconds) for notify mode.
 
 ## CSV Outputs
 
@@ -114,9 +130,10 @@ Columns:
 ## Project Structure
 
 ```
-cmd/Growthhack/       CLI entrypoint and command wiring
-pkg/github/            GitHub data collection logic
-pkg/reddit/            Reddit data collection logic
+cmd/                 CLI entrypoint and command wiring
+pkg/github/           GitHub data collection logic
+pkg/hackernews/       Hacker News data collection logic
+pkg/reddit/           Reddit data collection logic
 ```
 
 ## Development

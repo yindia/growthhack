@@ -9,10 +9,25 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var hnCSVHeader = []string{
+	"created_at",
+	"created_at_i",
+	"title",
+	"author",
+	"points",
+	"num_comments",
+	"url",
+	"hn_url",
+	"story_text_excerpt",
+	"object_id",
+	"query",
+}
 
 type searchResponse struct {
 	Hits    []hit `json:"hits"`
@@ -30,6 +45,11 @@ type hit struct {
 	CreatedAt   string `json:"created_at"`
 	CreatedAtI  int64  `json:"created_at_i"`
 	StoryText   string `json:"story_text"`
+}
+
+type result struct {
+	Hit   hit
+	Query string
 }
 
 type client struct {
@@ -97,69 +117,69 @@ func hnURL(id string) string {
 	return "https://news.ycombinator.com/item?id=" + id
 }
 
-func Run(ctx context.Context, topic, outPath string, limit, days, sleepMs int) error {
-	topic = strings.TrimSpace(topic)
-	if topic == "" {
-		return fmt.Errorf("topic is required")
-	}
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > 2000 {
-		limit = 2000
-	}
-	if days < 1 {
-		days = 365
-	}
-	if sleepMs < 0 {
-		sleepMs = 0
-	}
-
+func fetchResults(ctx context.Context, topics []string, limit, minutes, sleepMs int) ([]result, int) {
 	client := newClient()
-	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	cutoff := time.Now().Add(-time.Duration(minutes) * time.Minute)
 
-	results := make([]hit, 0, limit)
-	page := 0
+	resultsByID := map[string]result{}
 	reqCount := 0
 
-	for len(results) < limit {
-		endpoint := buildSearchURL(topic, page)
-		var resp searchResponse
-		if err := client.getJSON(ctx, endpoint, &resp); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: search failed (page %d): %v\n", page, err)
-			break
-		}
-
-		reqCount++
-		if sleepMs > 0 {
-			time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-		}
-
-		if len(resp.Hits) == 0 {
-			break
-		}
-
-		for _, h := range resp.Hits {
-			created := time.Unix(h.CreatedAtI, 0)
-			if created.Before(cutoff) {
-				continue
-			}
-			results = append(results, h)
-			if len(results) >= limit {
+	for _, topic := range topics {
+		page := 0
+		for len(resultsByID) < limit {
+			endpoint := buildSearchURL(topic, page)
+			var resp searchResponse
+			if err := client.getJSON(ctx, endpoint, &resp); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: search failed (page %d): %v\n", page, err)
 				break
 			}
+
+			reqCount++
+			if sleepMs > 0 {
+				time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+			}
+
+			if len(resp.Hits) == 0 {
+				break
+			}
+
+			for _, h := range resp.Hits {
+				if len(resultsByID) >= limit {
+					break
+				}
+				created := time.Unix(h.CreatedAtI, 0)
+				if created.Before(cutoff) {
+					continue
+				}
+				if _, ok := resultsByID[h.ObjectID]; ok {
+					continue
+				}
+				resultsByID[h.ObjectID] = result{Hit: h, Query: topic}
+			}
+
+			if resp.Page >= resp.NbPages-1 {
+				break
+			}
+			page++
 		}
 
-		if resp.Page >= resp.NbPages-1 {
+		if len(resultsByID) >= limit {
 			break
 		}
-		page++
 	}
 
-	if len(results) == 0 {
-		return fmt.Errorf("no results found")
+	results := make([]result, 0, len(resultsByID))
+	for _, r := range resultsByID {
+		results = append(results, r)
 	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Hit.CreatedAtI > results[j].Hit.CreatedAtI
+	})
 
+	return results, reqCount
+}
+
+func writeCSV(outPath string, results []result) error {
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
@@ -169,23 +189,24 @@ func Run(ctx context.Context, topic, outPath string, limit, days, sleepMs int) e
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	if err := w.Write([]string{
-		"created_at",
-		"created_at_i",
-		"title",
-		"author",
-		"points",
-		"num_comments",
-		"url",
-		"hn_url",
-		"story_text_excerpt",
-		"object_id",
-		"query",
-	}); err != nil {
+	if err := w.Write(hnCSVHeader); err != nil {
 		return fmt.Errorf("writing CSV header: %w", err)
 	}
 
-	for _, h := range results {
+	if err := writeRows(w, results); err != nil {
+		return err
+	}
+
+	if err := w.Error(); err != nil {
+		return fmt.Errorf("writing CSV: %w", err)
+	}
+
+	return nil
+}
+
+func writeRows(w *csv.Writer, results []result) error {
+	for _, r := range results {
+		h := r.Hit
 		createdAt := time.Unix(h.CreatedAtI, 0).UTC().Format(time.RFC3339)
 		err := w.Write([]string{
 			createdAt,
@@ -198,18 +219,128 @@ func Run(ctx context.Context, topic, outPath string, limit, days, sleepMs int) e
 			hnURL(h.ObjectID),
 			truncate(h.StoryText, 240),
 			h.ObjectID,
-			topic,
+			r.Query,
 		})
 		if err != nil {
 			return fmt.Errorf("writing CSV row: %w", err)
 		}
 	}
+	return nil
+}
 
-	if err := w.Error(); err != nil {
-		return fmt.Errorf("writing CSV: %w", err)
+func openAppendWriter(outPath string) (*os.File, *csv.Writer, error) {
+	var size int64
+	if info, err := os.Stat(outPath); err == nil {
+		size = info.Size()
+	} else if !os.IsNotExist(err) {
+		return nil, nil, fmt.Errorf("stat output file: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Done. Requests: %d | Wrote: %d -> %s\n",
-		reqCount, len(results), outPath)
-	return nil
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening output file: %w", err)
+	}
+
+	w := csv.NewWriter(f)
+	if size == 0 {
+		if err := w.Write(hnCSVHeader); err != nil {
+			f.Close()
+			return nil, nil, fmt.Errorf("writing CSV header: %w", err)
+		}
+		w.Flush()
+		if err := w.Error(); err != nil {
+			f.Close()
+			return nil, nil, fmt.Errorf("writing CSV header: %w", err)
+		}
+	}
+
+	return f, w, nil
+}
+
+func Run(ctx context.Context, topics []string, outPath string, limit, minutes, sleepMs, intervalSeconds int, notify bool) error {
+	cleanTopics := make([]string, 0, len(topics))
+	for _, topic := range topics {
+		topic = strings.TrimSpace(topic)
+		if topic != "" {
+			cleanTopics = append(cleanTopics, topic)
+		}
+	}
+	if len(cleanTopics) == 0 {
+		return fmt.Errorf("topic is required")
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	if minutes < 1 {
+		minutes = 1
+	}
+	if sleepMs < 0 {
+		sleepMs = 0
+	}
+	if intervalSeconds < 1 {
+		intervalSeconds = 30
+	}
+
+	if !notify {
+		results, reqCount := fetchResults(ctx, cleanTopics, limit, minutes, sleepMs)
+		if len(results) == 0 {
+			return fmt.Errorf("no results found")
+		}
+		if err := writeCSV(outPath, results); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "Done. Requests: %d | Wrote: %d -> %s\n",
+			reqCount, len(results), outPath)
+		return nil
+	}
+
+	f, w, err := openAppendWriter(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	defer w.Flush()
+
+	seen := map[string]bool{}
+	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		results, _ := fetchResults(ctx, cleanTopics, limit, minutes, sleepMs)
+		newOnes := make([]result, 0, len(results))
+		for _, r := range results {
+			if seen[r.Hit.ObjectID] {
+				continue
+			}
+			seen[r.Hit.ObjectID] = true
+			newOnes = append(newOnes, r)
+		}
+
+		sort.Slice(newOnes, func(i, j int) bool {
+			return newOnes[i].Hit.CreatedAtI < newOnes[j].Hit.CreatedAtI
+		})
+
+		for _, r := range newOnes {
+			fmt.Fprintf(os.Stderr, "Match: %s | %s\n", r.Hit.Title, hnURL(r.Hit.ObjectID))
+		}
+
+		if len(newOnes) > 0 {
+			if err := writeRows(w, newOnes); err != nil {
+				return err
+			}
+			w.Flush()
+			if err := w.Error(); err != nil {
+				return fmt.Errorf("writing CSV: %w", err)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
