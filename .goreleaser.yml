@@ -1,0 +1,55 @@
+version: 2
+project_name: growthhack
+
+builds:
+  - id: growthhack
+    main: ./main.go
+    binary: growthhack
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - "-s -w"
+
+archives:
+  - id: growthhack
+    builds: [growthhack]
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - ids: [growthhack]
+    homepage: "https://github.com/yindia/growthhack"
+    description: "Webhook router + worker SDK for GitHub, GitLab, Bitbucket. Route events by rules and consume via Watermill."
+    license: "MIT"
+    directory: Formula
+    repository:
+      owner: "yindia"
+      name: "homebrew-yindia"
+    test: |
+      system "#{bin}/growthhack", "--help"
+    install: |
+      bin.install "growthhack"
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  github:
+    owner: "yindia"
+    name: "growthhack"
+  draft: true
