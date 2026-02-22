@@ -1,12 +1,13 @@
-# Growthhacks
+# Growthhack
 
-Growthhacks is a small, focused CLI for collecting growth-hacking CSVs from GitHub and Reddit.
+Growthhack is a small, focused CLI for collecting growth-hacking CSVs from GitHub and Reddit.
 It helps you discover relevant users and conversations quickly, while keeping data collection reproducible.
 
 ## Features
 
 - GitHub: export contributor, issue author, PR author, stargazer, and fork owner emails (public only)
 - Reddit: search across topics with relevance scoring and write CSVs for outreach/analysis
+- Hacker News: search stories via the Algolia API and export CSVs for outreach/analysis
 - Fast, deterministic CSV output with clear column headers
 - Simple CLI built with Cobra
 
@@ -55,6 +56,18 @@ go run . reddit \
   --sleep-ms 850
 ```
 
+### Hacker News
+
+```bash
+# Search Hacker News and write a CSV of relevant stories
+go run . hackernews \
+  --topic "webhook integration" \
+  --out hackernews_posts.csv \
+  --limit 200 \
+  --days 365 \
+  --sleep-ms 200
+```
+
 ## CSV Outputs
 
 ### GitHub CSV
@@ -83,10 +96,25 @@ Columns:
 - `url`
 - `selftext_excerpt`
 
+### Hacker News CSV
+
+Columns:
+- `created_at`
+- `created_at_i`
+- `title`
+- `author`
+- `points`
+- `num_comments`
+- `url`
+- `hn_url`
+- `story_text_excerpt`
+- `object_id`
+- `query`
+
 ## Project Structure
 
 ```
-cmd/growthhacks/       CLI entrypoint and command wiring
+cmd/Growthhack/       CLI entrypoint and command wiring
 pkg/github/            GitHub data collection logic
 pkg/reddit/            Reddit data collection logic
 ```

@@ -9,7 +9,7 @@ func NewRootCmd() *cobra.Command {
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newGitHubCmd(), newRedditCmd())
+	cmd.AddCommand(newGitHubCmd(), newRedditCmd(), newHackerNewsCmd())
 
 	return cmd
 }
